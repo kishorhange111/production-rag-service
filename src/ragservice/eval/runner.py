@@ -149,6 +149,7 @@ def run_answer_eval(args) -> dict:
     """End-to-end answer quality with retrieval, versus the same model answering closed-book."""
     from ragservice.embeddings import build_embedder
     from ragservice.generation import ABSTAIN, HFLocalLLM
+    from ragservice.guardrails import should_abstain
     from ragservice.pipeline import RAGPipeline
 
     docs, items = load_squad_v2(args.n, args.seed)
@@ -157,11 +158,17 @@ def run_answer_eval(args) -> dict:
     pipe.ingest(docs)
 
     # 1) Retrieve for every question, then generate in batches (much faster than one by one).
+    # Same decision as the served pipeline (RAGPipeline.answer): if nothing survives retrieval
+    # and the injection screen, abstain without calling the LLM. Otherwise we'd evaluate a different system.
     retrieved = [pipe.retrieve(q.question)[0] for q in items]
-    prompts = [build_prompt(q.question, hits) for q, hits in zip(items, retrieved)]
-    outputs: list[str] = []
+    to_generate = [i for i, hits in enumerate(retrieved) if not should_abstain(hits)]
+    prompts = [build_prompt(items[i].question, retrieved[i]) for i in to_generate]
+    generated: list[str] = []
     for i in range(0, len(prompts), args.batch_size):
-        outputs += llm.complete_batch(prompts[i : i + args.batch_size], max_tokens=128)
+        generated += llm.complete_batch(prompts[i : i + args.batch_size], max_tokens=128)
+    outputs = [ABSTAIN] * len(items)
+    for i, text in zip(to_generate, generated):
+        outputs[i] = text
 
     # 2) Closed-book baseline: same model, same questions, no sources. Shows what retrieval adds.
     closed_prompts = [
