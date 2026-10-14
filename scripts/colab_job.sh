@@ -36,4 +36,4 @@ run retrieval python -m ragservice.eval.runner retrieval --n "$N" \
   --embedders BAAI/bge-small-en-v1.5 BAAI/bge-base-en-v1.5 --reranker BAAI/bge-reranker-base --out results/retrieval.json
 run answers python -m ragservice.eval.runner answers --n "$N" --embedders BAAI/bge-base-en-v1.5 \
   --generator Qwen/Qwen2.5-7B-Instruct --judge Qwen/Qwen2.5-7B-Instruct --out results/answers.json
-echo "DONE $(date -u +%T)"; cat results/failures.txt 2>/dev/null
+echo "DONE $(date -u +%T)"; cat results/failures.txt 2>/dev/null || true
