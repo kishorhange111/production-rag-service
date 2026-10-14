@@ -14,7 +14,12 @@ N=${N:-300}  # questions per type (answerable + unanswerable)
 DIR=/content/production-rag-service
 trap 'tar -czf /content/results.tgz -C "$DIR" results 2>/dev/null; echo "packed results ($(date -u +%T))"' EXIT
 set -e
-if [ ! -d "$DIR" ]; then git clone --depth 1 -b "$BRANCH" "$REPO" "$DIR"; else git -C "$DIR" fetch --depth 1 origin "$BRANCH" && git -C "$DIR" reset --hard FETCH_HEAD; fi
+# Clone into place even if DIR already holds restored results/checkpoints (a resumed runtime).
+if [ ! -d "$DIR/.git" ]; then
+  mkdir -p "$DIR" && git clone --depth 1 -b "$BRANCH" "$REPO" /content/_clone && cp -a /content/_clone/. "$DIR"/ && rm -rf /content/_clone
+else
+  git -C "$DIR" fetch --depth 1 origin "$BRANCH" && git -C "$DIR" reset --hard FETCH_HEAD
+fi
 cd "$DIR"
 pip install -q -e ".[ml]"
 nvidia-smi --query-gpu=name,memory.total --format=csv
