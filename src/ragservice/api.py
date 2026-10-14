@@ -5,31 +5,39 @@ Endpoints:
     POST /ingest         add documents (JSON), idempotent by chunk content
     POST /query          answer with citations (JSON)
     POST /query/stream   Server-Sent Events: a ``sources`` event first, then ``token`` events, then ``done``
-    GET  /metrics        request counts and latency percentiles (a stand-in for a Prometheus exporter)
+    GET  /metrics        Prometheus text format: request counter and a latency histogram
 
 Production touches:
     * a request id on every response (``X-Request-ID``), echoed from the client if provided, for log correlation
     * an optional API key (``RAG_API_KEY`` env var); if set, every call except /health must send ``X-API-Key``
     * request validation via Pydantic: bad input gets a 422 with details, never a stack trace
     * configuration only through environment variables (12-factor), see :func:`pipeline_from_env`
+
+Known limitation: the index lives in process memory, so run ONE worker per
+container (the Dockerfile does) and scale with replicas that each load the same
+saved index. Documents sent to /ingest reach only the replica that served the call;
+a shared vector store (pgvector, Qdrant) is the fix if ingestion must be live.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import time
 import uuid
-from collections import deque
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ragservice.chunking import Document
 from ragservice.embeddings import build_embedder
 from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM
 from ragservice.pipeline import RAGPipeline
+
+# Histogram bucket upper bounds in seconds (Prometheus default-style spacing).
+LATENCY_BUCKETS_S = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 
 
 # ------------------------------------------------------------------ schemas
@@ -90,13 +98,15 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
     """App factory: tests inject a pipeline; production builds one from the environment."""
     app = FastAPI(title="RAG service", version="0.1.0")
     app.state.pipeline = pipeline or pipeline_from_env()
-    # Rolling window of recent latencies: bounded memory, recent behaviour.
-    app.state.latencies = deque(maxlen=1000)
-    app.state.requests = 0
+    # Cumulative histogram counts per upper bound (Prometheus convention), plus a sum for computing the mean.
+    app.state.buckets = {b: 0 for b in LATENCY_BUCKETS_S}
+    app.state.latency_sum = 0.0
+    app.state.requests = {}
 
     def require_key(x_api_key: str | None = Header(default=None)) -> None:
         expected = os.environ.get("RAG_API_KEY")
-        if expected and x_api_key != expected:
+        # compare_digest takes the same time whatever the input, so the key can't be guessed byte by byte from response timings.
+        if expected and not hmac.compare_digest((x_api_key or "").encode(), expected.encode()):
             raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
     @app.middleware("http")
@@ -105,8 +115,13 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
         rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
         start = time.perf_counter()
         response = await call_next(request)
-        app.state.requests += 1
-        app.state.latencies.append((time.perf_counter() - start) * 1000)
+        elapsed = time.perf_counter() - start
+        key = (request.url.path, response.status_code)
+        app.state.requests[key] = app.state.requests.get(key, 0) + 1
+        app.state.latency_sum += elapsed
+        for b in LATENCY_BUCKETS_S:
+            if elapsed <= b:
+                app.state.buckets[b] += 1
         response.headers["X-Request-ID"] = rid
         return response
 
@@ -150,19 +165,20 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
-    @app.get("/metrics")
-    def metrics() -> dict:
-        lat = sorted(app.state.latencies)
-
-        def pct(p: float) -> float:
-            return round(lat[min(len(lat) - 1, int(p * len(lat)))], 2) if lat else 0.0
-
-        return {
-            "requests_total": app.state.requests,
-            "latency_ms_p50": pct(0.5),
-            "latency_ms_p95": pct(0.95),
-            "latency_ms_p99": pct(0.99),
-        }
+    @app.get("/metrics", response_class=PlainTextResponse)
+    def metrics() -> str:
+        """Prometheus exposition format, so a standard scraper and Grafana dashboards work unchanged."""
+        lines = ["# HELP rag_requests_total HTTP requests by path and status.", "# TYPE rag_requests_total counter"]
+        for (path, status), n in sorted(app.state.requests.items()):
+            lines.append(f'rag_requests_total{{path="{path}",status="{status}"}} {n}')
+        lines += ["# HELP rag_request_seconds Request latency.", "# TYPE rag_request_seconds histogram"]
+        total = sum(app.state.requests.values())
+        for b in LATENCY_BUCKETS_S:
+            lines.append(f'rag_request_seconds_bucket{{le="{b}"}} {app.state.buckets[b]}')
+        lines.append(f'rag_request_seconds_bucket{{le="+Inf"}} {total}')
+        lines.append(f"rag_request_seconds_sum {app.state.latency_sum:.6f}")
+        lines.append(f"rag_request_seconds_count {total}")
+        return "\n".join(lines) + "\n"
 
     return app
 

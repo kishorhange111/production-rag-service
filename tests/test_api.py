@@ -1,7 +1,5 @@
 """API tests with FastAPI's TestClient (no server, no network, no model)."""
 
-import json
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -70,8 +68,10 @@ def test_streaming_sends_sources_then_tokens_then_done(client):
     assert events[0] == "sources" and events[-1] == "done" and "token" in events
 
 
-def test_metrics_report_latency(client):
+def test_metrics_are_prometheus_text(client):
     client.get("/health")
-    m = client.get("/metrics").json()
-    assert m["requests_total"] >= 1 and m["latency_ms_p95"] >= 0
-    json.dumps(m)  # must be JSON-serialisable
+    r = client.get("/metrics")
+    assert r.headers["content-type"].startswith("text/plain")
+    body = r.text
+    assert 'rag_requests_total{path="/health",status="200"} 1' in body
+    assert 'rag_request_seconds_bucket{le="+Inf"}' in body and "rag_request_seconds_count" in body

@@ -6,7 +6,7 @@ ARG EXTRAS=""
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
-# Install dependencies before copying the code, so code edits don't invalidate this layer.
+# The package is installed from source, so dependencies and code are installed in one layer.
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install ".${EXTRAS:+[$EXTRAS]}"
@@ -18,4 +18,4 @@ USER app
 ENV RAG_DATA_DIR=/app/data/sample
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
-CMD ["uvicorn", "ragservice.api:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
+CMD ["uvicorn", "ragservice.api:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

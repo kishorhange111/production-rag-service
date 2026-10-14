@@ -107,11 +107,16 @@ def run_retrieval_ablation(args) -> dict:
     """BM25 vs dense (two embedding sizes) vs hybrid vs hybrid + reranker, on the same questions."""
     from ragservice.embeddings import build_embedder
     from ragservice.generation import ExtractiveLLM
+    from ragservice.guardrails import looks_like_injection
     from ragservice.pipeline import RAGPipeline
     from ragservice.retrieval import CrossEncoderReranker
 
     docs, items = load_squad_v2(args.n, args.seed)
     results = {"n_questions": len(items), "n_docs": len(docs), "configs": {}}
+    # Guardrail false positives: SQuAD passages are benign Wikipedia text, so every flagged one is a false alarm.
+    flagged = sum(looks_like_injection(d.text) for d in docs)
+    results["injection_screen_false_positive_rate"] = {"flagged": flagged, "passages": len(docs), "rate": flagged / max(len(docs), 1)}
+    print("injection screen false positives:", json.dumps(results["injection_screen_false_positive_rate"]), flush=True)
     for emb_name in args.embedders:
         pipe = RAGPipeline(build_embedder(emb_name), ExtractiveLLM())
         pipe.ingest(docs)
