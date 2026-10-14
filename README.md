@@ -12,7 +12,9 @@ A question-answering API over your own documents. It runs hybrid retrieval (BM25
 <!-- RESULTS:START -->
 ## Results
 
-_The Colab runs for this section are in progress. It will hold: the retrieval ablation (BM25 vs. dense vs. hybrid vs. hybrid + reranker; Recall@k, MRR, nDCG@10), end-to-end answer quality against a closed-book baseline, abstention on unanswerable questions, judged faithfulness, and the injection screen's false-positive rate._
+The SQuAD 2.0 evaluation below has not been run yet: the Colab GPU runtime for it was not available, so this repository makes no quality claims. `scripts/colab_job.sh` runs the retrieval ablation (BM25 vs. dense vs. hybrid vs. hybrid + reranker; Recall@k, MRR, nDCG@10) and the answer evaluation (closed-book baseline, abstention on unanswerable questions, judged faithfulness, false-positive rate of the injection screen) on one GPU.
+
+What is verified today is the service itself: the CPU test suite covers chunking, ranking, fusion, the injection screen, citation parsing, the metric formulas and the HTTP API, and CI builds the Docker image and checks its health endpoint.
 <!-- RESULTS:END -->
 
 ## Architecture
