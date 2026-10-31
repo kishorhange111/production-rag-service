@@ -90,21 +90,32 @@ The benchmark is SQuAD 2.0: 300 answerable and 300 unanswerable questions, retri
 ## Project layout
 
 ```
-src/ragservice/
-├── chunking.py     heading-aware chunks with overlap
-├── embeddings.py   sentence-transformers (with BGE query prefix) and a hashing fallback
-├── index.py        BM25 and dense indexes, save / load
-├── retrieval.py    RRF fusion, cross-encoder reranker
-├── guardrails.py   injection screen, abstention rule
-├── generation.py   prompt, citation parsing, LLM clients
-├── pipeline.py     retrieve → screen → generate
-├── api.py          FastAPI app
-└── eval/           SQuAD 2.0 loader, retrieval and answer metrics, runner
+production-rag-service/
+├── src/ragservice/             # the service (installable package)
+│   ├── chunking.py             #   heading-aware chunks with overlap
+│   ├── embeddings.py           #   sentence-transformers (with BGE query prefix) and a hashing fallback
+│   ├── index.py                #   BM25 and dense indexes, save / load
+│   ├── retrieval.py            #   RRF fusion, cross-encoder reranker
+│   ├── guardrails.py           #   injection screen, abstention rule
+│   ├── generation.py           #   prompt, citation parsing, LLM clients
+│   ├── pipeline.py             #   retrieve → screen → generate
+│   ├── api.py                  #   FastAPI app
+│   └── eval/                   #   SQuAD 2.0 loader, retrieval and answer metrics, runner
+├── data/sample/                # small document set the API and Docker smoke test serve
+├── scripts/                    # Colab evaluation job
+├── tests/                      # CPU-only tests, including the HTTP API
+├── Dockerfile                  # production image (uvicorn, health check)
+├── docker-compose.yml          # API + vLLM serving Qwen2.5-7B-Instruct
+├── .github/workflows/ci.yml    # lint + tests, then build the image and smoke-test the API
+├── Makefile                    # make install / install-dev / lint / test / serve / docker
+└── pyproject.toml              # package metadata, dependencies, ruff + pytest config
 ```
 
 ## Tests
 
 `pytest` runs on CPU with no model downloads. It covers chunk sizes and overlap, BM25 and dense ranking, fusion, the injection screen, citation parsing, the evaluation metrics, and the HTTP API: validation errors, the API key, request IDs, streaming order and the Prometheus output. CI also builds the Docker image and calls its health check.
+
+`make check` runs the same lint and test steps as CI, and `make help` lists the other commands. Optionally, `pip install pre-commit && pre-commit install` runs ruff before every commit.
 
 ## Limitations
 
