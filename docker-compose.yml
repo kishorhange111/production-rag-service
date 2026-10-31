@@ -1,0 +1,21 @@
+# Full stack on one GPU machine: vLLM serves the LLM, the RAG API calls it.
+#   docker compose up
+#   curl -s localhost:8080/query -H 'content-type: application/json' -d '{"question":"How long are backups kept?"}'
+services:
+  llm:
+    image: vllm/vllm-openai:v0.6.3
+    command: ["--model", "Qwen/Qwen2.5-7B-Instruct", "--max-model-len", "8192"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+    ports: ["8000:8000"]
+  api:
+    build: { context: ., args: { EXTRAS: ml } }
+    environment:
+      RAG_LLM_URL: http://llm:8000/v1
+      RAG_LLM_MODEL: Qwen/Qwen2.5-7B-Instruct
+      RAG_EMBEDDER: BAAI/bge-small-en-v1.5
+      RAG_MODE: hybrid
+    ports: ["8080:8080"]
+    depends_on: [llm]
