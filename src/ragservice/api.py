@@ -46,6 +46,7 @@ from ragservice.schemas import (
     SSEDonePayload,
     format_sse,
 )
+from ragservice.security import PromptDefenseMiddleware
 
 # Histogram bucket upper bounds in seconds (Prometheus default-style spacing).
 LATENCY_BUCKETS_S = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
@@ -87,9 +88,11 @@ def pipeline_from_env() -> RAGPipeline:
     return pipe
 
 
-def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
+def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool = True) -> FastAPI:
     """App factory: tests inject a pipeline; production builds one from the environment."""
     app = FastAPI(title="RAG service", version="0.1.0")
+    if enable_prompt_defense:
+        app.add_middleware(PromptDefenseMiddleware)
     app.state.pipeline = pipeline or pipeline_from_env()
     # Cumulative histogram counts per upper bound (Prometheus convention), plus a sum for computing the mean.
     app.state.buckets = {b: 0 for b in LATENCY_BUCKETS_S}
