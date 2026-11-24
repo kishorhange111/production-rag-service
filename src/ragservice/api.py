@@ -31,6 +31,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from ragservice.acl import AccessContext, MetadataFilter
 from ragservice.chunking import Document
 from ragservice.embeddings import build_embedder
 from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM
@@ -53,6 +54,11 @@ class IngestRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    tenant_id: str | None = None
+    principal_id: str | None = None
+    roles: list[str] = Field(default_factory=list)
+    clearance_level: int = 0
+    filters: dict = Field(default_factory=dict)
 
 
 class Source(BaseModel):
@@ -140,9 +146,24 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
             "total_chunks": len(app.state.pipeline.kb.chunks),
         }
 
+    def _build_access_and_filter(req: QueryRequest) -> tuple[AccessContext | None, MetadataFilter | None]:
+        access = (
+            AccessContext(
+                tenant_id=req.tenant_id,
+                principal_id=req.principal_id,
+                roles=frozenset(req.roles),
+                clearance_level=req.clearance_level,
+            )
+            if req.tenant_id is not None
+            else None
+        )
+        mfilter = MetadataFilter(equals=req.filters) if req.filters else None
+        return access, mfilter
+
     @app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_key)])
     def query(req: QueryRequest) -> QueryResponse:
-        ans = app.state.pipeline.answer(req.question)
+        access, mfilter = _build_access_and_filter(req)
+        ans = app.state.pipeline.answer(req.question, access=access, metadata_filter=mfilter)
         cited_ids = {id(h) for h in ans.citations}
         return QueryResponse(
             answer=ans.answer,
@@ -154,7 +175,8 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
 
     @app.post("/query/stream", dependencies=[Depends(require_key)])
     def query_stream(req: QueryRequest) -> StreamingResponse:
-        hits, tokens = app.state.pipeline.answer_stream(req.question)
+        access, mfilter = _build_access_and_filter(req)
+        hits, tokens = app.state.pipeline.answer_stream(req.question, access=access, metadata_filter=mfilter)
 
         def events():
             # Sources go first, so the UI can render them while the answer is still being written.

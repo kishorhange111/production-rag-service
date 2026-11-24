@@ -20,6 +20,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ragservice.acl import AccessContext, MetadataFilter, chunk_allowed
 from ragservice.chunking import Chunk
 from ragservice.index import KnowledgeBase
 
@@ -162,9 +163,23 @@ class Retriever:
         self.min_score = min_score
         self.max_per_doc = max_per_doc
 
-    def search_with_diagnostics(self, query: str, k: int = 5) -> tuple[list[Hit], RetrievalDiagnostics]:
-        bm25 = self.kb.bm25.search(query, self.candidates) if self.mode in ("bm25", "hybrid") else []
-        dense = self.kb.dense.search(self.kb.embedder.embed_query(query), self.candidates) if self.mode in ("dense", "hybrid") else []
+    def search_with_diagnostics(
+        self,
+        query: str,
+        k: int = 5,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> tuple[list[Hit], RetrievalDiagnostics]:
+        # When ACL or metadata filtering is active, expand candidate fetch so authorized chunks
+        # are not crowded out by higher-scoring unauthorized chunks.
+        fetch_k = max(self.candidates, len(self.kb.chunks)) if (access is not None or metadata_filter is not None) else self.candidates
+        bm25 = self.kb.bm25.search(query, fetch_k) if self.mode in ("bm25", "hybrid") else []
+        dense = self.kb.dense.search(self.kb.embedder.embed_query(query), fetch_k) if self.mode in ("dense", "hybrid") else []
+
+        if access is not None or metadata_filter is not None:
+            bm25 = [(i, s) for i, s in bm25 if chunk_allowed(self.kb.chunks[i], access, metadata_filter)]
+            dense = [(i, s) for i, s in dense if chunk_allowed(self.kb.chunks[i], access, metadata_filter)]
+
         bm25_rank = {i: r for r, (i, _) in enumerate(bm25)}
         dense_rank = {i: r for r, (i, _) in enumerate(dense)}
         bm25_scores = dict(bm25)
@@ -216,6 +231,12 @@ class Retriever:
         )
         return hits, diag
 
-    def search(self, query: str, k: int = 5) -> list[Hit]:
-        hits, _ = self.search_with_diagnostics(query, k=k)
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> list[Hit]:
+        hits, _ = self.search_with_diagnostics(query, k=k, access=access, metadata_filter=metadata_filter)
         return hits

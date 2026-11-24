@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ragservice.acl import AccessContext, MetadataFilter
 from ragservice.chunking import Document
 from ragservice.embeddings import Embedder
 from ragservice.generation import (
@@ -81,10 +82,15 @@ class RAGPipeline:
         return self.ingest(load_documents_from_directory(directory, patterns=patterns))
 
     # --------------------------------------------------------------- answering
-    def retrieve(self, question: str) -> tuple[list[Hit], int, float]:
-        """Search + injection screen. Returns (kept hits, number dropped, elapsed ms)."""
+    def retrieve(
+        self,
+        question: str,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> tuple[list[Hit], int, float]:
+        """Search + ACL/metadata filter + injection screen. Returns (kept hits, number dropped, elapsed ms)."""
         t = time.perf_counter()
-        screened = screen_hits(self.retriever.search(question, self.top_k))
+        screened = screen_hits(self.retriever.search(question, self.top_k, access=access, metadata_filter=metadata_filter))
         return screened.kept, len(screened.dropped), (time.perf_counter() - t) * 1000
 
     def finalize(
@@ -99,8 +105,13 @@ class RAGPipeline:
         cited = [hits[n - 1] for n in parse_citations(text, len(hits))]
         return Answer(question, text.strip(), cited, hits, is_abstention(text), dropped, timings)
 
-    def answer(self, question: str) -> Answer:
-        hits, dropped, t_ret = self.retrieve(question)
+    def answer(
+        self,
+        question: str,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> Answer:
+        hits, dropped, t_ret = self.retrieve(question, access=access, metadata_filter=metadata_filter)
         if should_abstain(hits):
             return Answer(question, ABSTAIN, [], hits, True, dropped, {"retrieval": t_ret})
         t = time.perf_counter()
@@ -113,9 +124,14 @@ class RAGPipeline:
             {"retrieval": t_ret, "generation": (time.perf_counter() - t) * 1000},
         )
 
-    def answer_stream(self, question: str) -> tuple[list[Hit], Iterator[str]]:
+    def answer_stream(
+        self,
+        question: str,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> tuple[list[Hit], Iterator[str]]:
         """Retrieve first (so sources can be sent to the client immediately), then stream the answer."""
-        hits, _, _ = self.retrieve(question)
+        hits, _, _ = self.retrieve(question, access=access, metadata_filter=metadata_filter)
         if should_abstain(hits):
             return hits, iter([ABSTAIN])
         return hits, self.llm.stream(build_prompt(question, hits))
