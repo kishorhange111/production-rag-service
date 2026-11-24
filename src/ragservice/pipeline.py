@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ragservice.acl import AccessContext, MetadataFilter
+from ragservice.cache import SemanticQueryCache
 from ragservice.chunking import Document
 from ragservice.embeddings import Embedder
 from ragservice.generation import (
@@ -60,18 +61,23 @@ class RAGPipeline:
         chunk_words: int = 200,
         overlap_words: int = 40,
         reranker=None,
+        cache: SemanticQueryCache | None = None,
     ):
         self.kb = KnowledgeBase(embedder)
         self.llm = llm
         self.top_k = top_k
         self.chunk_words, self.overlap_words = chunk_words, overlap_words
         self.retriever = Retriever(self.kb, mode=mode, reranker=reranker)
+        self.cache = cache
 
     # ------------------------------------------------------------- ingestion
     def ingest(self, docs: list[Document]) -> int:
         """Chunk and index documents (Markdown, HTML, CSV, text); returns the number of *new* chunks."""
         chunks = [c for d in docs for c in ingest_document(d, self.chunk_words, self.overlap_words)]
-        return self.kb.add(chunks)
+        added = self.kb.add(chunks)
+        if added and self.cache is not None:
+            self.cache.clear()
+        return added
 
     def ingest_directory(
         self,
@@ -111,18 +117,26 @@ class RAGPipeline:
         access: AccessContext | None = None,
         metadata_filter: MetadataFilter | None = None,
     ) -> Answer:
+        if self.cache is not None:
+            cached = self.cache.get(question, access=access, metadata_filter=metadata_filter)
+            if cached is not None:
+                return cached
         hits, dropped, t_ret = self.retrieve(question, access=access, metadata_filter=metadata_filter)
         if should_abstain(hits):
-            return Answer(question, ABSTAIN, [], hits, True, dropped, {"retrieval": t_ret})
-        t = time.perf_counter()
-        text = self.llm.complete(build_prompt(question, hits))
-        return self.finalize(
-            question,
-            text,
-            hits,
-            dropped,
-            {"retrieval": t_ret, "generation": (time.perf_counter() - t) * 1000},
-        )
+            ans = Answer(question, ABSTAIN, [], hits, True, dropped, {"retrieval": t_ret})
+        else:
+            t = time.perf_counter()
+            text = self.llm.complete(build_prompt(question, hits))
+            ans = self.finalize(
+                question,
+                text,
+                hits,
+                dropped,
+                {"retrieval": t_ret, "generation": (time.perf_counter() - t) * 1000},
+            )
+        if self.cache is not None:
+            self.cache.put(question, ans, access=access, metadata_filter=metadata_filter)
+        return ans
 
     def answer_stream(
         self,
