@@ -22,58 +22,45 @@ a shared vector store (pgvector, Qdrant) is the fix if ingestion must be live.
 from __future__ import annotations
 
 import hmac
-import json
 import os
 import time
 import uuid
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
 
 from ragservice.acl import AccessContext, MetadataFilter
 from ragservice.chunking import Document
+from ragservice.citations import verify_grounding
 from ragservice.embeddings import build_embedder
-from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM
+from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM, is_abstention, parse_citations
 from ragservice.pipeline import RAGPipeline
+from ragservice.schemas import (
+    DocumentIn,
+    GroundingSummary,
+    IngestRequest,
+    IngestResponse,
+    QueryRequest,
+    QueryResponse,
+    Source,
+    SSEDonePayload,
+    format_sse,
+)
 
 # Histogram bucket upper bounds in seconds (Prometheus default-style spacing).
 LATENCY_BUCKETS_S = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 
-
-# ------------------------------------------------------------------ schemas
-class DocumentIn(BaseModel):
-    doc_id: str = Field(..., min_length=1, max_length=512)
-    text: str = Field(..., min_length=1)
-    metadata: dict = Field(default_factory=dict)
-
-
-class IngestRequest(BaseModel):
-    documents: list[DocumentIn] = Field(..., min_length=1, max_length=1000)
-
-
-class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000)
-    tenant_id: str | None = None
-    principal_id: str | None = None
-    roles: list[str] = Field(default_factory=list)
-    clearance_level: int = 0
-    filters: dict = Field(default_factory=dict)
-
-
-class Source(BaseModel):
-    n: int
-    doc_id: str
-    heading: str
-    text: str
-
-
-class QueryResponse(BaseModel):
-    answer: str
-    abstained: bool
-    sources: list[Source]
-    cited: list[int]
-    timings_ms: dict[str, float]
+__all__ = [
+    "DocumentIn",
+    "GroundingSummary",
+    "IngestRequest",
+    "IngestResponse",
+    "QueryRequest",
+    "QueryResponse",
+    "Source",
+    "create_app",
+    "pipeline_from_env",
+]
 
 
 # ------------------------------------------------------------------ factory
@@ -132,19 +119,22 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
         return response
 
     def to_sources(hits) -> list[Source]:
-        return [Source(n=i, doc_id=h.chunk.doc_id, heading=h.chunk.heading, text=h.chunk.text) for i, h in enumerate(hits, start=1)]
+        return [
+            Source(n=i, doc_id=h.chunk.doc_id, heading=h.chunk.heading, text=h.chunk.text, score=round(h.score, 6))
+            for i, h in enumerate(hits, start=1)
+        ]
 
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok", "chunks": len(app.state.pipeline.kb.chunks)}
 
-    @app.post("/ingest", dependencies=[Depends(require_key)])
-    def ingest(req: IngestRequest) -> dict:
+    @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_key)])
+    def ingest(req: IngestRequest) -> IngestResponse:
         added = app.state.pipeline.ingest([Document(d.doc_id, d.text, d.metadata) for d in req.documents])
-        return {
-            "added_chunks": added,
-            "total_chunks": len(app.state.pipeline.kb.chunks),
-        }
+        return IngestResponse(
+            added_chunks=added,
+            total_chunks=len(app.state.pipeline.kb.chunks),
+        )
 
     def _build_access_and_filter(req: QueryRequest) -> tuple[AccessContext | None, MetadataFilter | None]:
         access = (
@@ -165,27 +155,68 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
         access, mfilter = _build_access_and_filter(req)
         ans = app.state.pipeline.answer(req.question, access=access, metadata_filter=mfilter)
         cited_ids = {id(h) for h in ans.citations}
+        grounding = None
+        if req.verify_grounding:
+            rep = verify_grounding(ans.answer, ans.retrieved)
+            grounding = GroundingSummary(
+                is_grounded=rep.is_grounded,
+                faithfulness_score=rep.faithfulness_score,
+                citation_precision=rep.citation_precision,
+                claim_coverage=rep.claim_coverage,
+                invalid_citations=rep.invalid_citation_indices,
+            )
         return QueryResponse(
             answer=ans.answer,
             abstained=ans.abstained,
             sources=to_sources(ans.retrieved),
             cited=[i for i, h in enumerate(ans.retrieved, start=1) if id(h) in cited_ids],
             timings_ms=ans.timings_ms,
+            grounding=grounding,
         )
 
     @app.post("/query/stream", dependencies=[Depends(require_key)])
     def query_stream(req: QueryRequest) -> StreamingResponse:
         access, mfilter = _build_access_and_filter(req)
+        t0 = time.perf_counter()
         hits, tokens = app.state.pipeline.answer_stream(req.question, access=access, metadata_filter=mfilter)
 
         def events():
+            seq = 1
             # Sources go first, so the UI can render them while the answer is still being written.
-            yield f"event: sources\ndata: {json.dumps([s.model_dump() for s in to_sources(hits)])}\n\n"
+            yield format_sse("sources", [s.model_dump() for s in to_sources(hits)], event_id=str(seq))
+            seq += 1
+            chunks_text: list[str] = []
+            tok_count = 0
             for tok in tokens:
-                yield f"event: token\ndata: {json.dumps(tok)}\n\n"
-            yield "event: done\ndata: {}\n\n"
+                chunks_text.append(tok)
+                tok_count += 1
+                yield format_sse("token", tok, event_id=str(seq))
+                seq += 1
+            full_text = "".join(chunks_text).strip()
+            if req.verify_grounding:
+                rep = verify_grounding(full_text, hits)
+                summary = GroundingSummary(
+                    is_grounded=rep.is_grounded,
+                    faithfulness_score=rep.faithfulness_score,
+                    citation_precision=rep.citation_precision,
+                    claim_coverage=rep.claim_coverage,
+                    invalid_citations=rep.invalid_citation_indices,
+                )
+                yield format_sse("grounding", summary, event_id=str(seq))
+                seq += 1
+            done = SSEDonePayload(
+                cited=parse_citations(full_text, len(hits)),
+                abstained=is_abstention(full_text),
+                token_count=tok_count,
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 3),
+            )
+            yield format_sse("done", done, event_id=str(seq))
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics() -> str:
