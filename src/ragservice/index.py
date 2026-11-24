@@ -161,6 +161,27 @@ class KnowledgeBase:
             self.dense.add(self.embedder.embed_documents(texts))
         return len(new)
 
+    def remove_doc(self, doc_id: str) -> int:
+        """Remove all chunks belonging to ``doc_id`` and keep BM25 + dense indexes aligned."""
+        keep_indices = [i for i, c in enumerate(self.chunks) if c.doc_id != doc_id]
+        removed = len(self.chunks) - len(keep_indices)
+        if removed == 0:
+            return 0
+        self.chunks = [self.chunks[i] for i in keep_indices]
+        self.bm25 = BM25Index(k1=self.bm25.k1, b=self.bm25.b)
+        if self.chunks:
+            self.bm25.add([c.text_for_index for c in self.chunks])
+            self.dense.vectors = self.dense.vectors[keep_indices]
+        else:
+            self.dense.vectors = np.zeros((0, self.embedder.dim), dtype=np.float32)
+        return removed
+
+    def upsert_doc(self, doc_id: str, chunks: list[Chunk]) -> tuple[int, int]:
+        """Atomically replace all chunks for ``doc_id``; returns ``(removed, added)``."""
+        removed = self.remove_doc(doc_id)
+        added = self.add(chunks)
+        return removed, added
+
     def save(self, directory: str | Path) -> None:
         d = Path(directory)
         d.mkdir(parents=True, exist_ok=True)
