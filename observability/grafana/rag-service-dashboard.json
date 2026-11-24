@@ -1,0 +1,85 @@
+{
+  "uid": "production-rag-service",
+  "title": "Production RAG Service — Serving & Quality SLIs",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "tags": ["rag", "llmops", "fastapi", "prometheus"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Request Rate (RPS) by Path & Status",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (path, status) (rate(rag_requests_total[1m]))",
+          "legendFormat": "{{path}} ({{status}})"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "End-to-End Request Latency (p50 / p95 / p99)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(rag_request_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rag_request_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(rag_request_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Pipeline Stage Avg Latency (Retrieval vs Generation)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(rag_stage_duration_seconds_sum[5m]) / clamp_min(rate(rag_stage_duration_seconds_count[5m]), 1)",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Indexed Chunks",
+      "gridPos": { "x": 12, "y": 8, "w": 4, "h": 8 },
+      "targets": [{ "expr": "rag_indexed_chunks", "legendFormat": "chunks" }]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Guardrail Blocks (5m)",
+      "gridPos": { "x": 16, "y": 8, "w": 4, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(rag_guardrail_blocks_total[5m]))",
+          "legendFormat": "blocked"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Abstentions (5m)",
+      "gridPos": { "x": 20, "y": 8, "w": 4, "h": 8 },
+      "targets": [
+        {
+          "expr": "increase(rag_abstentions_total[5m])",
+          "legendFormat": "abstentions"
+        }
+      ]
+    }
+  ]
+}
