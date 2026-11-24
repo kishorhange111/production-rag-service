@@ -34,6 +34,7 @@ from ragservice.chunking import Document
 from ragservice.citations import verify_grounding
 from ragservice.embeddings import build_embedder
 from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM, is_abstention, parse_citations
+from ragservice.observability import LATENCY_BUCKETS_S, MetricsRegistry, RAGTracer
 from ragservice.pipeline import RAGPipeline
 from ragservice.schemas import (
     DocumentIn,
@@ -48,14 +49,12 @@ from ragservice.schemas import (
 )
 from ragservice.security import PromptDefenseMiddleware
 
-# Histogram bucket upper bounds in seconds (Prometheus default-style spacing).
-LATENCY_BUCKETS_S = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
-
 __all__ = [
     "DocumentIn",
     "GroundingSummary",
     "IngestRequest",
     "IngestResponse",
+    "LATENCY_BUCKETS_S",
     "QueryRequest",
     "QueryResponse",
     "Source",
@@ -94,10 +93,9 @@ def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool 
     if enable_prompt_defense:
         app.add_middleware(PromptDefenseMiddleware)
     app.state.pipeline = pipeline or pipeline_from_env()
-    # Cumulative histogram counts per upper bound (Prometheus convention), plus a sum for computing the mean.
-    app.state.buckets = {b: 0 for b in LATENCY_BUCKETS_S}
-    app.state.latency_sum = 0.0
-    app.state.requests = {}
+    app.state.metrics = MetricsRegistry()
+    app.state.tracer = RAGTracer()
+    app.state.metrics.indexed_chunks = len(app.state.pipeline.kb.chunks)
 
     def require_key(x_api_key: str | None = Header(default=None)) -> None:
         expected = os.environ.get("RAG_API_KEY")
@@ -107,18 +105,18 @@ def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool 
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
-        """Attach a request id and record latency for every call."""
+        """Attach request/trace ids, emit an OTel span, and record Prometheus metrics."""
         rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
         start = time.perf_counter()
-        response = await call_next(request)
-        elapsed = time.perf_counter() - start
-        key = (request.url.path, response.status_code)
-        app.state.requests[key] = app.state.requests.get(key, 0) + 1
-        app.state.latency_sum += elapsed
-        for b in LATENCY_BUCKETS_S:
-            if elapsed <= b:
-                app.state.buckets[b] += 1
+        with app.state.tracer.span(f"http.{request.method}.{request.url.path}", {"request_id": rid}) as span:
+            response = await call_next(request)
+            elapsed = time.perf_counter() - start
+            span.attributes["http.status_code"] = response.status_code
+        app.state.metrics.observe_request(request.url.path, response.status_code, elapsed)
+        if response.headers.get("X-Threat-Blocked") == "true":
+            app.state.metrics.inc_guardrail_block("query")
         response.headers["X-Request-ID"] = rid
+        response.headers["X-Trace-ID"] = span.trace_id
         return response
 
     def to_sources(hits) -> list[Source]:
@@ -134,9 +132,11 @@ def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool 
     @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_key)])
     def ingest(req: IngestRequest) -> IngestResponse:
         added = app.state.pipeline.ingest([Document(d.doc_id, d.text, d.metadata) for d in req.documents])
+        total = len(app.state.pipeline.kb.chunks)
+        app.state.metrics.indexed_chunks = total
         return IngestResponse(
             added_chunks=added,
-            total_chunks=len(app.state.pipeline.kb.chunks),
+            total_chunks=total,
         )
 
     def _build_access_and_filter(req: QueryRequest) -> tuple[AccessContext | None, MetadataFilter | None]:
@@ -156,7 +156,14 @@ def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool 
     @app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_key)])
     def query(req: QueryRequest) -> QueryResponse:
         access, mfilter = _build_access_and_filter(req)
-        ans = app.state.pipeline.answer(req.question, access=access, metadata_filter=mfilter)
+        with app.state.tracer.span("rag.query", {"tenant_id": req.tenant_id or "default"}):
+            ans = app.state.pipeline.answer(req.question, access=access, metadata_filter=mfilter)
+        for stage, ms in ans.timings_ms.items():
+            app.state.metrics.observe_stage(stage, ms)
+        if ans.blocked_chunks:
+            app.state.metrics.inc_guardrail_block("context", ans.blocked_chunks)
+        if ans.abstained:
+            app.state.metrics.inc_abstention()
         cited_ids = {id(h) for h in ans.citations}
         grounding = None
         if req.verify_grounding:
@@ -224,17 +231,8 @@ def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics() -> str:
         """Prometheus exposition format, so a standard scraper and Grafana dashboards work unchanged."""
-        lines = ["# HELP rag_requests_total HTTP requests by path and status.", "# TYPE rag_requests_total counter"]
-        for (path, status), n in sorted(app.state.requests.items()):
-            lines.append(f'rag_requests_total{{path="{path}",status="{status}"}} {n}')
-        lines += ["# HELP rag_request_seconds Request latency.", "# TYPE rag_request_seconds histogram"]
-        total = sum(app.state.requests.values())
-        for b in LATENCY_BUCKETS_S:
-            lines.append(f'rag_request_seconds_bucket{{le="{b}"}} {app.state.buckets[b]}')
-        lines.append(f'rag_request_seconds_bucket{{le="+Inf"}} {total}')
-        lines.append(f"rag_request_seconds_sum {app.state.latency_sum:.6f}")
-        lines.append(f"rag_request_seconds_count {total}")
-        return "\n".join(lines) + "\n"
+        app.state.metrics.indexed_chunks = len(app.state.pipeline.kb.chunks)
+        return app.state.metrics.render_prometheus()
 
     return app
 
