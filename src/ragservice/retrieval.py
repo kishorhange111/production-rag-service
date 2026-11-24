@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from ragservice.chunking import Chunk
 from ragservice.index import KnowledgeBase
@@ -141,7 +141,7 @@ class Retriever:
         kb: KnowledgeBase,
         mode: Mode = "hybrid",
         candidates: int = 50,
-        reranker: CrossEncoderReranker | None = None,
+        reranker: Any | None = None,
         fusion: FusionStrategy = "rrf",
         rrf_k: int = 60,
         bm25_weight: float = 1.0,
