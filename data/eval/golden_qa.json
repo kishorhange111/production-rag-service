@@ -1,0 +1,72 @@
+[
+  {
+    "id": "db-pgbouncer-port",
+    "question": "Which port do applications use to connect to the database through PgBouncer?",
+    "expected_doc_ids": ["database.md"],
+    "reference_answers": ["6432"],
+    "answerable": true
+  },
+  {
+    "id": "db-migrations-tool",
+    "question": "What tool is used for database schema migrations?",
+    "expected_doc_ids": ["database.md"],
+    "reference_answers": ["Alembic"],
+    "answerable": true
+  },
+  {
+    "id": "db-backup-retention",
+    "question": "How long are full nightly database backups kept?",
+    "expected_doc_ids": ["database.md"],
+    "reference_answers": ["35 days"],
+    "answerable": true
+  },
+  {
+    "id": "db-pitr-window",
+    "question": "How many days of point-in-time recovery are available for the database?",
+    "expected_doc_ids": ["database.md"],
+    "reference_answers": ["7 days"],
+    "answerable": true
+  },
+  {
+    "id": "deploy-staging",
+    "question": "Which environment receives automatic deployments on every merge to main?",
+    "expected_doc_ids": ["deployment.md"],
+    "reference_answers": ["staging"],
+    "answerable": true
+  },
+  {
+    "id": "deploy-rollback-channel",
+    "question": "Where must rollbacks be announced with the release id?",
+    "expected_doc_ids": ["deployment.md"],
+    "reference_answers": ["#incidents", "incidents"],
+    "answerable": true
+  },
+  {
+    "id": "onboard-python-tooling",
+    "question": "Which Python version and dependency manager are used in the development environment?",
+    "expected_doc_ids": ["onboarding.md"],
+    "reference_answers": ["Python 3.11", "uv"],
+    "answerable": true
+  },
+  {
+    "id": "onboard-oncall-start",
+    "question": "When do new engineers join the on-call rotation and how long are shifts?",
+    "expected_doc_ids": ["onboarding.md"],
+    "reference_answers": ["90 days", "one week"],
+    "answerable": true
+  },
+  {
+    "id": "unanswerable-quantum",
+    "question": "What is the superconducting qubit coherence frequency of our quantum accelerator?",
+    "expected_doc_ids": [],
+    "reference_answers": [],
+    "answerable": false
+  },
+  {
+    "id": "unanswerable-cafeteria",
+    "question": "What is the vegetarian lunch menu in the Zurich office cafeteria?",
+    "expected_doc_ids": [],
+    "reference_answers": [],
+    "answerable": false
+  }
+]
