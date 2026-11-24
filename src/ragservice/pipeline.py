@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ragservice.chunking import Document, chunk_document
+from ragservice.chunking import Document
 from ragservice.embeddings import Embedder
 from ragservice.generation import (
     ABSTAIN,
@@ -22,6 +22,7 @@ from ragservice.generation import (
 )
 from ragservice.guardrails import screen_hits, should_abstain
 from ragservice.index import KnowledgeBase
+from ragservice.ingestion import ingest_document, load_documents_from_directory
 from ragservice.retrieval import Hit, Mode, Retriever
 
 
@@ -67,15 +68,17 @@ class RAGPipeline:
 
     # ------------------------------------------------------------- ingestion
     def ingest(self, docs: list[Document]) -> int:
-        """Chunk and index documents; returns the number of *new* chunks."""
-        chunks = [c for d in docs for c in chunk_document(d, self.chunk_words, self.overlap_words)]
+        """Chunk and index documents (Markdown, HTML, CSV, text); returns the number of *new* chunks."""
+        chunks = [c for d in docs for c in ingest_document(d, self.chunk_words, self.overlap_words)]
         return self.kb.add(chunks)
 
-    def ingest_directory(self, directory: str | Path, patterns: tuple[str, ...] = ("*.md", "*.txt")) -> int:
-        """Ingest every Markdown/text file under ``directory`` (the path is the document id)."""
-        root = Path(directory)
-        docs = [Document(str(p.relative_to(root)), p.read_text(errors="ignore")) for pat in patterns for p in sorted(root.rglob(pat))]
-        return self.ingest(docs)
+    def ingest_directory(
+        self,
+        directory: str | Path,
+        patterns: tuple[str, ...] = ("*.md", "*.txt", "*.html", "*.htm", "*.csv"),
+    ) -> int:
+        """Ingest every supported file under ``directory`` (the relative path is the document id)."""
+        return self.ingest(load_documents_from_directory(directory, patterns=patterns))
 
     # --------------------------------------------------------------- answering
     def retrieve(self, question: str) -> tuple[list[Hit], int, float]:
