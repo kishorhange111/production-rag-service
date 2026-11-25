@@ -1,0 +1,75 @@
+# Production Docker Compose stack: RAG API + Prometheus + Grafana (+ optional GPU vLLM profile).
+# Usage (CPU demo + observability):
+#   docker compose -f docker-compose.prod.yml up --build
+# Usage (GPU with vLLM):
+#   docker compose -f docker-compose.prod.yml --profile gpu up --build
+services:
+  api:
+    build:
+      context: .
+      args:
+        EXTRAS: ${RAG_DOCKER_EXTRAS:-}
+    restart: unless-stopped
+    environment:
+      RAG_EMBEDDER: ${RAG_EMBEDDER:-hashing}
+      RAG_LLM_URL: ${RAG_LLM_URL:-}
+      RAG_LLM_MODEL: ${RAG_LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      RAG_MODE: ${RAG_MODE:-hybrid}
+      RAG_TOP_K: ${RAG_TOP_K:-5}
+      RAG_DATA_DIR: /app/data/sample
+      RAG_API_KEY: ${RAG_API_KEY:-}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  vllm:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:v0.6.3
+    restart: unless-stopped
+    command: ["--model", "Qwen/Qwen2.5-7B-Instruct", "--max-model-len", "8192"]
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
