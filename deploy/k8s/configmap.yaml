@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-service-config
+  labels:
+    app: rag-service
+data:
+  RAG_MODE: "hybrid"
+  RAG_TOP_K: "5"
+  RAG_EMBEDDER: "BAAI/bge-small-en-v1.5"
+  RAG_DATA_DIR: "/app/data/sample"

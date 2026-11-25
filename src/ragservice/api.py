@@ -22,52 +22,45 @@ a shared vector store (pgvector, Qdrant) is the fix if ingestion must be live.
 from __future__ import annotations
 
 import hmac
-import json
 import os
 import time
 import uuid
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
 
+from ragservice.acl import AccessContext, MetadataFilter
 from ragservice.chunking import Document
+from ragservice.citations import verify_grounding
 from ragservice.embeddings import build_embedder
-from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM
+from ragservice.generation import ExtractiveLLM, OpenAICompatibleLLM, is_abstention, parse_citations
+from ragservice.observability import LATENCY_BUCKETS_S, MetricsRegistry, RAGTracer
 from ragservice.pipeline import RAGPipeline
+from ragservice.schemas import (
+    DocumentIn,
+    GroundingSummary,
+    IngestRequest,
+    IngestResponse,
+    QueryRequest,
+    QueryResponse,
+    Source,
+    SSEDonePayload,
+    format_sse,
+)
+from ragservice.security import PromptDefenseMiddleware
 
-# Histogram bucket upper bounds in seconds (Prometheus default-style spacing).
-LATENCY_BUCKETS_S = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
-
-
-# ------------------------------------------------------------------ schemas
-class DocumentIn(BaseModel):
-    doc_id: str = Field(..., min_length=1, max_length=512)
-    text: str = Field(..., min_length=1)
-    metadata: dict = Field(default_factory=dict)
-
-
-class IngestRequest(BaseModel):
-    documents: list[DocumentIn] = Field(..., min_length=1, max_length=1000)
-
-
-class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000)
-
-
-class Source(BaseModel):
-    n: int
-    doc_id: str
-    heading: str
-    text: str
-
-
-class QueryResponse(BaseModel):
-    answer: str
-    abstained: bool
-    sources: list[Source]
-    cited: list[int]
-    timings_ms: dict[str, float]
+__all__ = [
+    "DocumentIn",
+    "GroundingSummary",
+    "IngestRequest",
+    "IngestResponse",
+    "LATENCY_BUCKETS_S",
+    "QueryRequest",
+    "QueryResponse",
+    "Source",
+    "create_app",
+    "pipeline_from_env",
+]
 
 
 # ------------------------------------------------------------------ factory
@@ -94,14 +87,15 @@ def pipeline_from_env() -> RAGPipeline:
     return pipe
 
 
-def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
+def create_app(pipeline: RAGPipeline | None = None, enable_prompt_defense: bool = True) -> FastAPI:
     """App factory: tests inject a pipeline; production builds one from the environment."""
     app = FastAPI(title="RAG service", version="0.1.0")
+    if enable_prompt_defense:
+        app.add_middleware(PromptDefenseMiddleware)
     app.state.pipeline = pipeline or pipeline_from_env()
-    # Cumulative histogram counts per upper bound (Prometheus convention), plus a sum for computing the mean.
-    app.state.buckets = {b: 0 for b in LATENCY_BUCKETS_S}
-    app.state.latency_sum = 0.0
-    app.state.requests = {}
+    app.state.metrics = MetricsRegistry()
+    app.state.tracer = RAGTracer()
+    app.state.metrics.indexed_chunks = len(app.state.pipeline.kb.chunks)
 
     def require_key(x_api_key: str | None = Header(default=None)) -> None:
         expected = os.environ.get("RAG_API_KEY")
@@ -111,74 +105,134 @@ def create_app(pipeline: RAGPipeline | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
-        """Attach a request id and record latency for every call."""
+        """Attach request/trace ids, emit an OTel span, and record Prometheus metrics."""
         rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
         start = time.perf_counter()
-        response = await call_next(request)
-        elapsed = time.perf_counter() - start
-        key = (request.url.path, response.status_code)
-        app.state.requests[key] = app.state.requests.get(key, 0) + 1
-        app.state.latency_sum += elapsed
-        for b in LATENCY_BUCKETS_S:
-            if elapsed <= b:
-                app.state.buckets[b] += 1
+        with app.state.tracer.span(f"http.{request.method}.{request.url.path}", {"request_id": rid}) as span:
+            response = await call_next(request)
+            elapsed = time.perf_counter() - start
+            span.attributes["http.status_code"] = response.status_code
+        app.state.metrics.observe_request(request.url.path, response.status_code, elapsed)
+        if response.headers.get("X-Threat-Blocked") == "true":
+            app.state.metrics.inc_guardrail_block("query")
         response.headers["X-Request-ID"] = rid
+        response.headers["X-Trace-ID"] = span.trace_id
         return response
 
     def to_sources(hits) -> list[Source]:
-        return [Source(n=i, doc_id=h.chunk.doc_id, heading=h.chunk.heading, text=h.chunk.text) for i, h in enumerate(hits, start=1)]
+        return [
+            Source(n=i, doc_id=h.chunk.doc_id, heading=h.chunk.heading, text=h.chunk.text, score=round(h.score, 6))
+            for i, h in enumerate(hits, start=1)
+        ]
 
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok", "chunks": len(app.state.pipeline.kb.chunks)}
 
-    @app.post("/ingest", dependencies=[Depends(require_key)])
-    def ingest(req: IngestRequest) -> dict:
+    @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_key)])
+    def ingest(req: IngestRequest) -> IngestResponse:
         added = app.state.pipeline.ingest([Document(d.doc_id, d.text, d.metadata) for d in req.documents])
-        return {
-            "added_chunks": added,
-            "total_chunks": len(app.state.pipeline.kb.chunks),
-        }
+        total = len(app.state.pipeline.kb.chunks)
+        app.state.metrics.indexed_chunks = total
+        return IngestResponse(
+            added_chunks=added,
+            total_chunks=total,
+        )
+
+    def _build_access_and_filter(req: QueryRequest) -> tuple[AccessContext | None, MetadataFilter | None]:
+        access = (
+            AccessContext(
+                tenant_id=req.tenant_id,
+                principal_id=req.principal_id,
+                roles=frozenset(req.roles),
+                clearance_level=req.clearance_level,
+            )
+            if req.tenant_id is not None
+            else None
+        )
+        mfilter = MetadataFilter(equals=req.filters) if req.filters else None
+        return access, mfilter
 
     @app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_key)])
     def query(req: QueryRequest) -> QueryResponse:
-        ans = app.state.pipeline.answer(req.question)
+        access, mfilter = _build_access_and_filter(req)
+        with app.state.tracer.span("rag.query", {"tenant_id": req.tenant_id or "default"}):
+            ans = app.state.pipeline.answer(req.question, access=access, metadata_filter=mfilter)
+        for stage, ms in ans.timings_ms.items():
+            app.state.metrics.observe_stage(stage, ms)
+        if ans.blocked_chunks:
+            app.state.metrics.inc_guardrail_block("context", ans.blocked_chunks)
+        if ans.abstained:
+            app.state.metrics.inc_abstention()
         cited_ids = {id(h) for h in ans.citations}
+        grounding = None
+        if req.verify_grounding:
+            rep = verify_grounding(ans.answer, ans.retrieved)
+            grounding = GroundingSummary(
+                is_grounded=rep.is_grounded,
+                faithfulness_score=rep.faithfulness_score,
+                citation_precision=rep.citation_precision,
+                claim_coverage=rep.claim_coverage,
+                invalid_citations=rep.invalid_citation_indices,
+            )
         return QueryResponse(
             answer=ans.answer,
             abstained=ans.abstained,
             sources=to_sources(ans.retrieved),
             cited=[i for i, h in enumerate(ans.retrieved, start=1) if id(h) in cited_ids],
             timings_ms=ans.timings_ms,
+            grounding=grounding,
         )
 
     @app.post("/query/stream", dependencies=[Depends(require_key)])
     def query_stream(req: QueryRequest) -> StreamingResponse:
-        hits, tokens = app.state.pipeline.answer_stream(req.question)
+        access, mfilter = _build_access_and_filter(req)
+        t0 = time.perf_counter()
+        hits, tokens = app.state.pipeline.answer_stream(req.question, access=access, metadata_filter=mfilter)
 
         def events():
+            seq = 1
             # Sources go first, so the UI can render them while the answer is still being written.
-            yield f"event: sources\ndata: {json.dumps([s.model_dump() for s in to_sources(hits)])}\n\n"
+            yield format_sse("sources", [s.model_dump() for s in to_sources(hits)], event_id=str(seq))
+            seq += 1
+            chunks_text: list[str] = []
+            tok_count = 0
             for tok in tokens:
-                yield f"event: token\ndata: {json.dumps(tok)}\n\n"
-            yield "event: done\ndata: {}\n\n"
+                chunks_text.append(tok)
+                tok_count += 1
+                yield format_sse("token", tok, event_id=str(seq))
+                seq += 1
+            full_text = "".join(chunks_text).strip()
+            if req.verify_grounding:
+                rep = verify_grounding(full_text, hits)
+                summary = GroundingSummary(
+                    is_grounded=rep.is_grounded,
+                    faithfulness_score=rep.faithfulness_score,
+                    citation_precision=rep.citation_precision,
+                    claim_coverage=rep.claim_coverage,
+                    invalid_citations=rep.invalid_citation_indices,
+                )
+                yield format_sse("grounding", summary, event_id=str(seq))
+                seq += 1
+            done = SSEDonePayload(
+                cited=parse_citations(full_text, len(hits)),
+                abstained=is_abstention(full_text),
+                token_count=tok_count,
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 3),
+            )
+            yield format_sse("done", done, event_id=str(seq))
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics() -> str:
         """Prometheus exposition format, so a standard scraper and Grafana dashboards work unchanged."""
-        lines = ["# HELP rag_requests_total HTTP requests by path and status.", "# TYPE rag_requests_total counter"]
-        for (path, status), n in sorted(app.state.requests.items()):
-            lines.append(f'rag_requests_total{{path="{path}",status="{status}"}} {n}')
-        lines += ["# HELP rag_request_seconds Request latency.", "# TYPE rag_request_seconds histogram"]
-        total = sum(app.state.requests.values())
-        for b in LATENCY_BUCKETS_S:
-            lines.append(f'rag_request_seconds_bucket{{le="{b}"}} {app.state.buckets[b]}')
-        lines.append(f'rag_request_seconds_bucket{{le="+Inf"}} {total}')
-        lines.append(f"rag_request_seconds_sum {app.state.latency_sum:.6f}")
-        lines.append(f"rag_request_seconds_count {total}")
-        return "\n".join(lines) + "\n"
+        app.state.metrics.indexed_chunks = len(app.state.pipeline.kb.chunks)
+        return app.state.metrics.render_prometheus()
 
     return app
 

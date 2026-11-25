@@ -1,0 +1,48 @@
+name: RAG Eval Regression Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package
+        run: pip install -e ".[dev]"
+      - name: Run RAG evaluation regression gate
+        run: |
+          python -m ragservice.eval.gate \
+            --corpus data/sample \
+            --golden data/eval/golden_qa.json \
+            --mode bm25 \
+            --top-k 3 \
+            --out eval-report.json \
+            --summary-md eval-summary.md
+      - name: Publish step summary
+        if: always()
+        run: |
+          if [ -f eval-summary.md ]; then
+            cat eval-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload eval report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-eval-report
+          path: eval-report.json
+          if-no-files-found: ignore

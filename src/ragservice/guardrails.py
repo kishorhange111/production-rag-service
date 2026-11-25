@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass
 
 from ragservice.retrieval import Hit
+from ragservice.security import inspect_text
 
 _INJECTION_PATTERNS = [
     r"ignore (all |any )?(previous|prior|above) (instructions|prompts|messages)",
@@ -32,8 +33,8 @@ _INJECTION = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
 
 
 def looks_like_injection(text: str) -> bool:
-    """True if the text contains a known prompt-injection phrase."""
-    return bool(_INJECTION.search(text))
+    """True if the text contains a known or obfuscated prompt-injection / poisoning payload."""
+    return bool(_INJECTION.search(text)) or inspect_text(text).blocked
 
 
 @dataclass(frozen=True)

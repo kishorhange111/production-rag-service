@@ -11,7 +11,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ragservice.chunking import Document, chunk_document
+from ragservice.acl import AccessContext, MetadataFilter
+from ragservice.cache import SemanticQueryCache
+from ragservice.chunking import Document
 from ragservice.embeddings import Embedder
 from ragservice.generation import (
     ABSTAIN,
@@ -22,6 +24,7 @@ from ragservice.generation import (
 )
 from ragservice.guardrails import screen_hits, should_abstain
 from ragservice.index import KnowledgeBase
+from ragservice.ingestion import ingest_document, load_documents_from_directory
 from ragservice.retrieval import Hit, Mode, Retriever
 
 
@@ -58,30 +61,42 @@ class RAGPipeline:
         chunk_words: int = 200,
         overlap_words: int = 40,
         reranker=None,
+        cache: SemanticQueryCache | None = None,
     ):
         self.kb = KnowledgeBase(embedder)
         self.llm = llm
         self.top_k = top_k
         self.chunk_words, self.overlap_words = chunk_words, overlap_words
         self.retriever = Retriever(self.kb, mode=mode, reranker=reranker)
+        self.cache = cache
 
     # ------------------------------------------------------------- ingestion
     def ingest(self, docs: list[Document]) -> int:
-        """Chunk and index documents; returns the number of *new* chunks."""
-        chunks = [c for d in docs for c in chunk_document(d, self.chunk_words, self.overlap_words)]
-        return self.kb.add(chunks)
+        """Chunk and index documents (Markdown, HTML, CSV, text); returns the number of *new* chunks."""
+        chunks = [c for d in docs for c in ingest_document(d, self.chunk_words, self.overlap_words)]
+        added = self.kb.add(chunks)
+        if added and self.cache is not None:
+            self.cache.clear()
+        return added
 
-    def ingest_directory(self, directory: str | Path, patterns: tuple[str, ...] = ("*.md", "*.txt")) -> int:
-        """Ingest every Markdown/text file under ``directory`` (the path is the document id)."""
-        root = Path(directory)
-        docs = [Document(str(p.relative_to(root)), p.read_text(errors="ignore")) for pat in patterns for p in sorted(root.rglob(pat))]
-        return self.ingest(docs)
+    def ingest_directory(
+        self,
+        directory: str | Path,
+        patterns: tuple[str, ...] = ("*.md", "*.txt", "*.html", "*.htm", "*.csv"),
+    ) -> int:
+        """Ingest every supported file under ``directory`` (the relative path is the document id)."""
+        return self.ingest(load_documents_from_directory(directory, patterns=patterns))
 
     # --------------------------------------------------------------- answering
-    def retrieve(self, question: str) -> tuple[list[Hit], int, float]:
-        """Search + injection screen. Returns (kept hits, number dropped, elapsed ms)."""
+    def retrieve(
+        self,
+        question: str,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> tuple[list[Hit], int, float]:
+        """Search + ACL/metadata filter + injection screen. Returns (kept hits, number dropped, elapsed ms)."""
         t = time.perf_counter()
-        screened = screen_hits(self.retriever.search(question, self.top_k))
+        screened = screen_hits(self.retriever.search(question, self.top_k, access=access, metadata_filter=metadata_filter))
         return screened.kept, len(screened.dropped), (time.perf_counter() - t) * 1000
 
     def finalize(
@@ -96,23 +111,41 @@ class RAGPipeline:
         cited = [hits[n - 1] for n in parse_citations(text, len(hits))]
         return Answer(question, text.strip(), cited, hits, is_abstention(text), dropped, timings)
 
-    def answer(self, question: str) -> Answer:
-        hits, dropped, t_ret = self.retrieve(question)
+    def answer(
+        self,
+        question: str,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> Answer:
+        if self.cache is not None:
+            cached = self.cache.get(question, access=access, metadata_filter=metadata_filter)
+            if cached is not None:
+                return cached
+        hits, dropped, t_ret = self.retrieve(question, access=access, metadata_filter=metadata_filter)
         if should_abstain(hits):
-            return Answer(question, ABSTAIN, [], hits, True, dropped, {"retrieval": t_ret})
-        t = time.perf_counter()
-        text = self.llm.complete(build_prompt(question, hits))
-        return self.finalize(
-            question,
-            text,
-            hits,
-            dropped,
-            {"retrieval": t_ret, "generation": (time.perf_counter() - t) * 1000},
-        )
+            ans = Answer(question, ABSTAIN, [], hits, True, dropped, {"retrieval": t_ret})
+        else:
+            t = time.perf_counter()
+            text = self.llm.complete(build_prompt(question, hits))
+            ans = self.finalize(
+                question,
+                text,
+                hits,
+                dropped,
+                {"retrieval": t_ret, "generation": (time.perf_counter() - t) * 1000},
+            )
+        if self.cache is not None:
+            self.cache.put(question, ans, access=access, metadata_filter=metadata_filter)
+        return ans
 
-    def answer_stream(self, question: str) -> tuple[list[Hit], Iterator[str]]:
+    def answer_stream(
+        self,
+        question: str,
+        access: AccessContext | None = None,
+        metadata_filter: MetadataFilter | None = None,
+    ) -> tuple[list[Hit], Iterator[str]]:
         """Retrieve first (so sources can be sent to the client immediately), then stream the answer."""
-        hits, _, _ = self.retrieve(question)
+        hits, _, _ = self.retrieve(question, access=access, metadata_filter=metadata_filter)
         if should_abstain(hits):
             return hits, iter([ABSTAIN])
         return hits, self.llm.stream(build_prompt(question, hits))
