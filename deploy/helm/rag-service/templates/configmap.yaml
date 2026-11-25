@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  RAG_MODE: {{ .Values.config.ragMode | quote }}
+  RAG_TOP_K: {{ .Values.config.ragTopK | quote }}
+  RAG_EMBEDDER: {{ .Values.config.ragEmbedder | quote }}
+  RAG_DATA_DIR: {{ .Values.config.ragDataDir | quote }}
+  {{- if .Values.config.ragLlmUrl }}
+  RAG_LLM_URL: {{ .Values.config.ragLlmUrl | quote }}
+  RAG_LLM_MODEL: {{ .Values.config.ragLlmModel | quote }}
+  {{- end }}

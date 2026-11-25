@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rag-service
+  labels:
+    app: rag-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: rag-service

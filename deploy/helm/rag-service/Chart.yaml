@@ -1,0 +1,6 @@
+apiVersion: v2
+name: rag-service
+description: Production-grade hybrid RAG service with multi-tenant ACLs, grounding verification, and Prometheus/OTel observability.
+type: application
+version: 0.2.0
+appVersion: "0.1.0"
