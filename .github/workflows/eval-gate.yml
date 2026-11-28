@@ -41,7 +41,7 @@ jobs:
           fi
       - name: Upload eval report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rag-eval-report
           path: eval-report.json
